@@ -1,0 +1,178 @@
+#[allow(duplicate_alias)]
+module freelance::freelance {
+    use sui::object::{UID, ID};
+    use sui::tx_context::{TxContext, sender};
+    use sui::coin::{Self, Coin};
+    use sui::balance;
+    use sui::transfer;
+    use sui::event;
+    use sui::sui::SUI;
+    use std::option;
+
+    // === Constants ===
+    const ENotClient: u64 = 0;
+    const ENotFreelancer: u64 = 1;
+    const EJobNotOpen: u64 = 2;
+    const EJobAlreadyAccepted: u64 = 3;
+    const EInsufficientFunds: u64 = 4;
+    const EInvalidEscrow: u64 = 5;
+    const EJobNotCompleted: u64 = 6;
+    const ENoFreelancer: u64 = 7;
+
+    // === Events ===
+    public struct JobCreated has copy, drop {
+        job_id: ID,
+        client: address,
+        budget: u64
+    }
+
+    public struct PaymentReleased has copy, drop {
+        job_id: ID,
+        amount: u64
+    }
+
+    // === Core Structs ===
+    public struct JobPost has key, store {
+        id: UID,
+        description: vector<u8>,
+        budget: u64,
+        client: address,
+        freelancer: option::Option<address>,
+        status: u8, // 0=Open, 1=Accepted, 2=Completed
+        escrow_vault: ID
+    }
+
+    public struct EscrowVault has key, store {
+        id: UID,
+        balance: balance::Balance<SUI>  // Fixed balance type
+    }
+
+    // === Core Functions ===
+    public entry fun create_job(
+        description: vector<u8>,
+        budget: Coin<SUI>,
+        ctx: &mut TxContext
+    ) {
+        let client_addr = sender(ctx);
+        let balance = coin::into_balance(budget);
+        let escrow = EscrowVault {
+            id: object::new(ctx),
+            balance
+        };
+        
+        let job = JobPost {
+            id: object::new(ctx),
+            description,
+            budget: balance::value(&escrow.balance),
+            client: client_addr,
+            freelancer: option::none(),
+            status: 0,
+            escrow_vault: object::id(&escrow)
+        };
+
+        event::emit(JobCreated {
+            job_id: object::uid_to_inner(&job.id),
+            client: client_addr,
+            budget: job.budget
+        });
+
+        transfer::public_transfer(job, client_addr);
+        transfer::public_transfer(escrow, client_addr);
+    }
+
+    public entry fun accept_job(
+        job: &mut JobPost,
+        escrow: &EscrowVault,
+        ctx: &mut TxContext
+    ) {
+        assert!(option::is_none(&job.freelancer), EJobAlreadyAccepted);
+        assert!(job.status == 0, EJobNotOpen);
+        assert!(balance::value(&escrow.balance) == job.budget, EInsufficientFunds);
+        assert!(object::id(escrow) == job.escrow_vault, EInvalidEscrow);
+
+        option::fill(&mut job.freelancer, sender(ctx));
+        job.status = 1;
+    }
+
+    public entry fun mark_completed(
+        job: &mut JobPost,
+        ctx: &mut TxContext
+    ) {
+        assert!(option::contains(&job.freelancer, &sender(ctx)), ENotFreelancer);
+        job.status = 2;
+    }
+
+    public entry fun release_payment(
+        job: &mut JobPost,
+        escrow: EscrowVault,
+        ctx: &mut TxContext
+    ) {
+        assert!(sender(ctx) == job.client, ENotClient);
+        assert!(job.status == 2, EJobNotCompleted);
+        assert!(option::is_some(&job.freelancer), ENoFreelancer);
+
+        let EscrowVault { id, balance } = escrow;
+        let payment = coin::from_balance(balance, ctx);  // Added ctx parameter
+        let freelancer_addr = *option::borrow(&job.freelancer);
+        
+        transfer::public_transfer(payment, freelancer_addr);
+        object::delete(id);
+        
+        event::emit(PaymentReleased {
+            job_id: object::uid_to_inner(&job.id),
+            amount: job.budget
+        });
+
+        job.status = 3; // Closed
+    }
+
+// === Tests === 
+#[test_only]
+use sui::test_scenario;
+
+#[test]
+fun test_full_workflow() {
+    let client = @0xCAFE;
+    let freelancer = @0xBEEF;
+    let mut scenario = test_scenario::begin(client);
+    
+    // 1. Client creates job
+    let budget = sui::coin::mint_for_testing<SUI>(
+        1000, 
+        test_scenario::ctx(&mut scenario)
+    );
+    test_scenario::next_tx(&mut scenario, client);
+    {
+        create_job(b"Build website", budget, test_scenario::ctx(&mut scenario));
+    };
+    
+    // 2. Freelancer accepts job (FIXED)
+    test_scenario::next_tx(&mut scenario, freelancer);
+    {
+        let mut job = test_scenario::take_from_address<JobPost>(&scenario, client);
+        let escrow = test_scenario::take_from_address<EscrowVault>(&scenario, client);
+        accept_job(&mut job, &escrow, test_scenario::ctx(&mut scenario));
+        test_scenario::return_to_address(client, job);
+        test_scenario::return_to_address(client, escrow);
+    };
+    
+    // 3. Freelancer marks completed (FIXED)
+    test_scenario::next_tx(&mut scenario, freelancer);
+    {
+        let mut job = test_scenario::take_from_address<JobPost>(&scenario, client);
+        mark_completed(&mut job, test_scenario::ctx(&mut scenario));
+        test_scenario::return_to_address(client, job);
+    };
+    
+    // 4. Client releases payment (FIXED)
+    test_scenario::next_tx(&mut scenario, client);
+    {
+        let mut job = test_scenario::take_from_address<JobPost>(&scenario, client);
+        let escrow = test_scenario::take_from_address<EscrowVault>(&scenario, client);
+        release_payment(&mut job, escrow, test_scenario::ctx(&mut scenario));
+        test_scenario::return_to_address(client, job); // Return job after release
+    };
+    
+    test_scenario::end(scenario);
+}
+}
